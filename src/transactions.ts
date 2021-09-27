@@ -1,9 +1,4 @@
-import type {JSONValue, ReadonlyJSONValue} from './json';
-import type {
-  CommitTransactionResponse,
-  CloseTransactionResponse,
-  RebaseOpts,
-} from './repm-invoker';
+import {deepClone, JSONValue, ReadonlyJSONValue} from './json';
 import {
   KeyTypeForScanOptions,
   ScanOptions,
@@ -11,8 +6,9 @@ import {
 } from './scan-options';
 import {ScanResult} from './scan-iterator';
 import {throwIfClosed} from './transaction-closed-error';
-import * as embed from './embed/mod';
-import type * as db from './db/mod';
+import * as db from './db/mod';
+import * as sync from './sync/mod';
+import type {LogContext} from './logger';
 
 /**
  * ReadTransactions are used with [[Replicache.query]] and
@@ -63,72 +59,55 @@ export interface ReadTransaction {
   ): ScanResult<Key, ReadonlyJSONValue>;
 }
 
-export class ReadTransactionImpl<Value extends ReadonlyJSONValue>
-  implements ReadTransaction
-{
-  protected _transactionId = -1;
-  protected _closed = false;
-  protected readonly _dbName: string;
-  protected readonly _openResponse: Promise<unknown>;
-  protected readonly _shouldClone: boolean = false;
+let transactionIDCounter = 0;
 
-  constructor(dbName: string, openResponse: Promise<unknown>) {
-    this._dbName = dbName;
-    this._openResponse = openResponse;
+export class ReadTransactionImpl<
+  Value extends ReadonlyJSONValue = ReadonlyJSONValue,
+> implements ReadTransaction
+{
+  protected readonly _dbtx: db.Read;
+  protected readonly _lc: LogContext;
+
+  constructor(
+    dbRead: db.Read,
+    lc: LogContext,
+    rpcName = 'openReadTransaction',
+  ) {
+    this._dbtx = dbRead;
+    this._lc = lc
+      .addContext('rpc', rpcName)
+      .addContext('txid', transactionIDCounter++);
   }
 
   async get(key: string): Promise<Value | undefined> {
-    throwIfClosed(this);
-    return embed.get(this._transactionId, key, this._shouldClone) as
-      | Value
-      | undefined;
+    throwIfClosed(this._dbtx);
+    const rv = this._dbtx.get(key);
+    if (this._dbtx instanceof db.Write) {
+      return (rv && deepClone(rv)) as Value | undefined;
+    }
+    return rv as Value | undefined;
   }
 
   async has(key: string): Promise<boolean> {
-    throwIfClosed(this);
-    return embed.has(this._transactionId, key);
+    throwIfClosed(this._dbtx);
+    return this._dbtx.has(key);
   }
 
   async isEmpty(): Promise<boolean> {
-    throwIfClosed(this);
-
-    let empty = true;
-    await embed.scan(
-      this._transactionId,
-      {limit: 1},
-      () => (empty = false),
-      false, // shouldClone
-    );
-    return empty;
+    throwIfClosed(this._dbtx);
+    return this._dbtx.isEmpty();
   }
 
   scan<Options extends ScanOptions, Key extends KeyTypeForScanOptions<Options>>(
     options?: Options,
   ): ScanResult<Key, Value> {
+    const dbRead = this._dbtx;
     return new ScanResult(
       options,
-      () => this,
+      () => dbRead,
       false, // shouldCloseTransaction
-      this._shouldClone,
+      dbRead instanceof db.Write, // shouldClone,
     );
-  }
-
-  get id(): number {
-    return this._transactionId;
-  }
-
-  get closed(): boolean {
-    return this._closed;
-  }
-
-  async open(): Promise<void> {
-    await this._openResponse;
-    this._transactionId = await embed.openReadTransaction(this._dbName);
-  }
-
-  async close(): Promise<CloseTransactionResponse> {
-    this._closed = true;
-    return await embed.closeTransaction(this._transactionId);
   }
 }
 
@@ -211,49 +190,37 @@ export class WriteTransactionImpl
   extends ReadTransactionImpl<JSONValue>
   implements WriteTransaction
 {
-  protected readonly _shouldClone: boolean = true;
-  private readonly _name: string;
-  private readonly _args: JSONValue;
-  private readonly _rebaseOpts: RebaseOpts | undefined;
+  // use `declare` to specialize the type.
+  protected declare readonly _dbtx: db.Write;
 
   constructor(
-    dbName: string,
-    openResponse: Promise<unknown>,
-    name: string,
-    args: JSONValue,
-    rebaseOpts: RebaseOpts | undefined,
+    dbWrite: db.Write,
+    lc: LogContext,
+    rpcName = 'openWriteTransaction',
   ) {
-    super(dbName, openResponse);
-    this._name = name;
-    this._args = args;
-    this._rebaseOpts = rebaseOpts;
+    super(dbWrite, lc, rpcName);
   }
 
   async put(key: string, value: JSONValue): Promise<void> {
-    throwIfClosed(this);
-    await embed.put(this.id, key, value);
+    throwIfClosed(this._dbtx);
+    await this._dbtx.put(this._lc, key, deepClone(value));
   }
 
   async del(key: string): Promise<boolean> {
-    throwIfClosed(this);
-    return await embed.del(this.id, key);
+    throwIfClosed(this._dbtx);
+    return await this._dbtx.del(this._lc, key);
   }
 
   async commit(
     generateChangedKeys: boolean,
-  ): Promise<CommitTransactionResponse> {
-    this._closed = true;
-    return await embed.commitTransaction(this.id, generateChangedKeys);
-  }
+  ): Promise<[string, sync.ChangedKeysMap]> {
+    const txn = this._dbtx;
+    throwIfClosed(txn);
 
-  async open(): Promise<void> {
-    await this._openResponse;
-    this._transactionId = await embed.openWriteTransaction(
-      this._dbName,
-      this._name,
-      this._args,
-      this._rebaseOpts,
-    );
+    const headName = txn.isRebase()
+      ? sync.SYNC_HEAD_NAME
+      : db.DEFAULT_HEAD_NAME;
+    return await txn.commitWithChangedKeys(headName, generateChangedKeys);
   }
 }
 
@@ -306,13 +273,17 @@ export interface CreateIndexDefinition {
 }
 
 export class IndexTransactionImpl
-  extends ReadTransactionImpl<ReadonlyJSONValue>
+  extends WriteTransactionImpl
   implements IndexTransaction
 {
+  constructor(dbWrite: db.Write, lc: LogContext) {
+    super(dbWrite, lc, 'openIndexTransaction');
+  }
+
   async createIndex(options: CreateIndexDefinition): Promise<void> {
-    throwIfClosed(this);
-    await embed.createIndex(
-      this.id,
+    throwIfClosed(this._dbtx);
+    await this._dbtx.createIndex(
+      this._lc,
       options.name,
       options.prefix ?? options.keyPrefix ?? '',
       options.jsonPointer,
@@ -320,17 +291,11 @@ export class IndexTransactionImpl
   }
 
   async dropIndex(name: string): Promise<void> {
-    throwIfClosed(this);
-    await embed.dropIndex(this.id, name);
+    throwIfClosed(this._dbtx);
+    await this._dbtx.dropIndex(name);
   }
 
-  async commit(): Promise<CommitTransactionResponse> {
-    this._closed = true;
-    return await embed.commitTransaction(this.id, false);
-  }
-
-  async open(): Promise<void> {
-    await this._openResponse;
-    this._transactionId = await embed.openIndexTransaction(this._dbName);
+  async commit(): Promise<[string, sync.ChangedKeysMap]> {
+    return super.commit(false);
   }
 }

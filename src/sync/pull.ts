@@ -1,22 +1,14 @@
 import type * as dag from '../dag/mod';
 import * as db from '../db/mod';
-import {deepClone, ReadonlyJSONValue} from '../json';
+import {deepClone, JSONValue, ReadonlyJSONValue} from '../json';
 import {assertPullResponse, Puller, PullError, PullResponse} from '../puller';
-import {
-  assertHTTPRequestInfo,
-  BeginPullRequest,
-  BeginPullResponse,
-  ChangedKeysMap,
-  HTTPRequestInfo,
-  MaybeEndPullRequest,
-  MaybeEndPullResponse,
-  ReplayMutation,
-} from '../repm-invoker';
+import {assertHTTPRequestInfo, HTTPRequestInfo} from '../http-request-info';
 import {callJSRequest} from './js-request';
 import {SYNC_HEAD_NAME} from './sync-head-name';
 import * as patch from './patch';
 import * as prolly from '../prolly/mod';
 import type {LogContext} from '../logger';
+import {toError} from '../to-error';
 
 export const PULL_VERSION = 0;
 
@@ -31,19 +23,22 @@ export type PullRequest = {
   schemaVersion: string;
 };
 
-export interface InternalPuller {
-  pull(
-    pullReq: PullRequest,
-    url: string,
-    auth: string,
-    requestID: string,
-  ): Promise<[PullResponse | undefined, HTTPRequestInfo]>;
-}
+export type BeginPullRequest = {
+  pullURL: string;
+  pullAuth: string;
+  schemaVersion: string;
+  puller: Puller;
+};
+
+export type BeginPullResponse = {
+  httpRequestInfo: HTTPRequestInfo;
+  syncHead: string;
+};
 
 export async function beginPull(
   clientID: string,
   beginPullReq: BeginPullRequest,
-  puller: InternalPuller,
+  puller: Puller,
   requestID: string,
   store: dag.Store,
   lc: LogContext,
@@ -70,9 +65,10 @@ export async function beginPull(
   };
   lc.debug?.('Starting pull...');
   const pullStart = Date.now();
-  const [pullResp, httpRequestInfo] = await puller.pull(
-    pullReq,
+  const [pullResp, httpRequestInfo] = await callPuller(
+    puller,
     pullURL,
+    pullReq,
     pullAuth,
     requestID,
   );
@@ -89,14 +85,13 @@ export async function beginPull(
     return {
       httpRequestInfo,
       syncHead: '',
-      requestID,
     };
   }
 
   // It is possible that another sync completed while we were pulling. Ensure
   // that is not the case by re-checking the base snapshot.
   return await store.withWrite(async dagWrite => {
-    const dagRead = dagWrite.read();
+    const dagRead = dagWrite;
     const mainHeadPostPull = await dagRead.getHead(db.DEFAULT_HEAD_NAME);
 
     if (mainHeadPostPull === undefined) {
@@ -131,7 +126,6 @@ export async function beginPull(
       return {
         httpRequestInfo,
         syncHead,
-        requestID,
       };
     }
 
@@ -173,24 +167,44 @@ export async function beginPull(
         errorMessage: '',
       },
       syncHead: commitHash,
-      requestID,
     };
   });
 }
 
+/**
+ * ReplayMutation is used int the RPC between EndPull so that we can replay
+ * mutations ontop of the current state. It is never exposed to the public.
+ */
+export type ReplayMutation = {
+  id: number;
+  name: string;
+  args: JSONValue;
+  original: string;
+};
+
+// The changed keys in different indexes. The key of the map is the index name.
+// "" is used for the primary index.
+export type ChangedKeysMap = Map<string, string[]>;
+
+export type MaybeEndPullResult = {
+  replayMutations?: ReplayMutation[];
+  syncHead: string;
+  changedKeys: ChangedKeysMap;
+};
+
 export async function maybeEndPull(
   store: dag.Store,
   lc: LogContext,
-  maybeEndPullReq: MaybeEndPullRequest,
-): Promise<MaybeEndPullResponse> {
+  expectedSyncHead: string,
+): Promise<MaybeEndPullResult> {
   // Ensure sync head is what the caller thinks it is.
   return await store.withWrite(async dagWrite => {
-    const dagRead = dagWrite.read();
+    const dagRead = dagWrite;
     const syncHeadHash = await dagRead.getHead(SYNC_HEAD_NAME);
     if (syncHeadHash === undefined) {
       throw new Error('Missing sync head');
     }
-    if (syncHeadHash !== maybeEndPullReq.syncHead) {
+    if (syncHeadHash !== expectedSyncHead) {
       throw new Error('Wrong sync head JSLogInfo');
     }
 
@@ -300,30 +314,19 @@ export async function maybeEndPull(
   });
 }
 
-export class JSPuller implements InternalPuller {
-  private readonly _puller: Puller;
-
-  constructor(puller: Puller) {
-    this._puller = puller;
-  }
-
-  async pull(
-    pullReq: PullRequest,
-    url: string,
-    auth: string,
-    requestID: string,
-  ): Promise<[PullResponse | undefined, HTTPRequestInfo]> {
-    const {clientID, cookie, lastMutationID, pullVersion, schemaVersion} =
-      pullReq;
-
-    const body = {clientID, cookie, lastMutationID, pullVersion, schemaVersion};
-    try {
-      const res = await callJSRequest(this._puller, url, body, auth, requestID);
-      assertResult(res);
-      return [res.response, res.httpRequestInfo];
-    } catch (e) {
-      throw new PullError(e);
-    }
+async function callPuller(
+  puller: Puller,
+  url: string,
+  body: PullRequest,
+  auth: string,
+  requestID: string,
+): Promise<[PullResponse | undefined, HTTPRequestInfo]> {
+  try {
+    const res = await callJSRequest(puller, url, body, auth, requestID);
+    assertResult(res);
+    return [res.response, res.httpRequestInfo];
+  } catch (e) {
+    throw new PullError(toError(e));
   }
 }
 
